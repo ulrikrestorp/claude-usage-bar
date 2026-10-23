@@ -19,6 +19,9 @@ Also available in the official [xbar-plugins](https://github.com/matryer/xbar-pl
 Colors adapt to light and dark appearance. The menu bar item is
 [configurable](#configuration).
 
+**Several accounts** are shown side by side — see
+[Multiple accounts](#multiple-accounts).
+
 ---
 
 ## Requirements
@@ -82,8 +85,9 @@ Optional. Create `~/.claude-usage.conf` with `KEY=value` lines:
 
 | Key | Values | Default | Effect |
 |---|---|---|---|
-| `MENUBAR` | `session`, `both` | `session` | `both` also shows the weekly figure: `✦ 42% · 18%` |
+| `MENUBAR` | `session`, `weekly`, `both` | `session` | Which limit the menu bar shows. `both`: `✦ 42% · 18%` |
 | `MENUBAR_COLOR` | `true`, `false` | `true` | `false` leaves the menu bar text uncolored so it follows the system menu bar color |
+| `LABEL.<email>` | any short text | — | Tag shown before that account's figure when several accounts are signed in |
 
 ```
 MENUBAR=both
@@ -93,14 +97,43 @@ MENUBAR_COLOR=false
 With `MENUBAR=both`, the color reflects whichever limit is tightest, so a
 weekly squeeze is visible even when the session window is fresh.
 
-The file also caches `ORG_ID` after the first run. The dropdown is unaffected
-by these settings.
+The dropdown is unaffected by these settings.
+
+---
+
+## Multiple accounts
+
+Signed in to more than one Claude account — say in two Chrome profiles, or
+Chrome and Safari? Keep a claude.ai tab open for each and the plugin shows
+them all: one figure per account in the menu bar, joined by `·` and sorted by
+email, and a section per account in the dropdown.
+
+```
+✦ 42% · 7%          MENUBAR=session (default)
+✦ 18% · 95%         MENUBAR=weekly
+✦ 42%/18% · 7%/95%  MENUBAR=both
+```
+
+To tell them apart in the menu bar, give each a label:
+
+```
+LABEL.me@work.com=W
+LABEL.me@home.com=P
+```
+
+which reads `✦ W 42% · P 7%`. Several tabs of the same account are counted
+once. If an account's tab is closed, its last reading stays in the dropdown,
+marked stale, for up to six hours.
+
+With a single account everything looks exactly as before.
 
 ---
 
 ## How it works
 
-SwiftBar runs the script every minute. The script uses AppleScript to execute a `XMLHttpRequest` inside your open claude.ai browser tab — calling Anthropic's internal `/api/organizations/{id}/usage` endpoint with your existing session. The response is parsed and displayed.
+SwiftBar runs the script every minute. The script uses AppleScript to execute a `XMLHttpRequest` inside each open claude.ai browser tab — calling Anthropic's internal `/api/organizations/{id}/usage` endpoint with that tab's existing session. Each tab answers for the account signed in to its browser profile. The response is parsed and displayed.
+
+Which account and organization a tab belongs to is looked up once via `/api/bootstrap` and remembered in the page until it reloads, so a normal refresh costs one request per account. The organization is the one claude.ai has active, so the figures match claude.ai's own usage page even if you also belong to an API (Console) organization.
 
 Your credentials never leave your machine. The script does not store session tokens.
 

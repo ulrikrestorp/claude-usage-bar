@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # <xbar.title>Claude Usage</xbar.title>
-# <xbar.version>v2.4</xbar.version>
+# <xbar.version>v3.0</xbar.version>
 # <xbar.author>aggel008</xbar.author>
 # <xbar.author.github>aggel008</xbar.author.github>
 # <xbar.desc>Live Claude.ai session (5h) and weekly usage in your menu bar — no API keys, reads directly from your browser</xbar.desc>
@@ -9,7 +9,7 @@
 # <xbar.dependencies>python3</xbar.dependencies>
 # <xbar.abouturl>https://github.com/aggel008/claude-usage-bar</xbar.abouturl>
 # <swiftbar.title>Claude Usage</swiftbar.title>
-# <swiftbar.version>2.4</swiftbar.version>
+# <swiftbar.version>3.0</swiftbar.version>
 # <swiftbar.author>aggel008</swiftbar.author>
 # <swiftbar.author.github>aggel008</swiftbar.author.github>
 # <swiftbar.desc>Live Claude.ai session (5h) and weekly usage in your menu bar — no API keys, reads directly from your browser</swiftbar.desc>
@@ -78,30 +78,21 @@ def load_config():
                 cfg[k.strip()] = v.strip()
     return cfg
 
-def save_org(org_id):
-    cfg = load_config()
-    cfg['ORG_ID'] = org_id
-    with open(CONFIG, 'w') as f:
-        for k, v in cfg.items():
-            f.write(f'{k}={v}\n')
-
-def save_cache(payload):
-    try:
-        with open(CACHE, 'w') as f:
-            json.dump({'ts': time.time(), 'data': payload}, f)
-    except Exception:
-        pass
-
 def load_cache():
+    """{account_uuid: {ts, email, data}}. Caches from single-account versions are ignored."""
     try:
         with open(CACHE) as f:
             c = json.load(f)
-        age = time.time() - c['ts']
-        if age <= MAX_STALE:
-            return c['data'], age
+        return c.get('accounts', {}) if isinstance(c, dict) else {}
+    except Exception:
+        return {}
+
+def save_cache(accounts):
+    try:
+        with open(CACHE, 'w') as f:
+            json.dump({'accounts': accounts}, f)
     except Exception:
         pass
-    return None, None
 
 # ── browser plumbing ──────────────────────────────────────────────────────────
 def as_str(s):
@@ -143,71 +134,135 @@ def classify(stderr):
         return 'NOT_RUNNING'
     return 'ERROR'
 
-def run_js(app, engine, js):
-    """Return (status, payload). status in OK / NO_TAB / JS_DISABLED / NO_AUTOMATION / ERROR."""
-    lit = as_str(js)
-    exec_line = (f'return (do JavaScript {lit} in theTab) as text' if engine == 'safari'
-                 else f'return (execute theTab javascript {lit}) as text')
-    script = f'''tell application {as_str(app)}
-	set theTab to missing value
+# Runs inside each claude.ai tab. A tab carries the cookies of its browser
+# profile, so tabs in different profiles (or browsers) answer for different
+# accounts.
+#
+# The tab remembers which account and org it belongs to in a page global, so
+# /api/bootstrap is only fetched when that is missing (first run, page
+# reload), when claude.ai's active org changed, or when /usage fails.
+# The org is the one claude.ai has active (lastActiveOrg cookie), else the
+# first that can chat: memberships[0] is often an API (Console) org.
+#
+# SEEN, prepended by the AppleScript, lists the account uuids already read
+# this run so further tabs of the same account skip the usage call.
+# Returns "OK\t<uuid>\t<json>", "SEEN" or "ERR\t<status>\t<detail>".
+TAB_JS = r"""(function(){
+function g(p){var x=new XMLHttpRequest();x.open('GET',p,false);
+x.setRequestHeader('Accept','application/json');x.send();return x;}
+var c=(document.cookie.match(/(?:^|; )lastActiveOrg=([^;]+)/)||[])[1]||'';
+function who(){
+  var b=g('/api/bootstrap');
+  if(b.status!=200)return 'HTTP\t'+b.status;
+  var a=JSON.parse(b.responseText).account;
+  if(!a||!a.uuid)return 'HTTP\t401';
+  var ms=(a.memberships||[]).map(function(m){return m.organization;});
+  var o=ms.filter(function(o){return o.uuid==c;})[0]
+    ||ms.filter(function(o){return (o.capabilities||[]).indexOf('chat')>=0;})[0]
+    ||ms[0];
+  if(!o)return 'NO_ORG\t'+a.email_address;
+  window.__claudeUsage={uuid:a.uuid,email:a.email_address,org:o.uuid,cookie:c};
+  return null;
+}
+var k=window.__claudeUsage,fresh=false,e;
+if(!k||k.cookie!=c){e=who();if(e)return 'ERR\t'+e;k=window.__claudeUsage;fresh=true;}
+if(SEEN.indexOf(k.uuid)>=0)return 'SEEN';
+var u=g('/api/organizations/'+k.org+'/usage');
+if(u.status!=200&&!fresh){e=who();if(e)return 'ERR\t'+e;k=window.__claudeUsage;
+  u=g('/api/organizations/'+k.org+'/usage');}
+if(u.status!=200)return 'ERR\tHTTP\t'+u.status;
+return 'OK\t'+k.uuid+'\t'+JSON.stringify({email:k.email,data:JSON.parse(u.responseText)});
+})()"""
+
+def run_all_tabs(app, engine):
+    """Run TAB_JS in every claude.ai tab of one browser, across all windows.
+
+    Returns (status, lines). status in OK / NO_TAB / JS_DISABLED / NO_AUTOMATION / ERROR.
+    """
+    exec_line = ('set r to (do JavaScript js in t) as text' if engine == 'safari'
+                 else 'set r to (execute t javascript js) as text')
+    script = f'''set body to {as_str(TAB_JS)}
+tell application {as_str(app)}
+	set out to ""
+	set seen to ""
+	set found to false
 	repeat with w in windows
 		try
-			repeat with t in tabs of w
-				if URL of t contains "claude.ai" then
-					set theTab to t
-					exit repeat
-				end if
-			end repeat
+			set ts to tabs of w
+		on error
+			set ts to {{}}
 		end try
-		if theTab is not missing value then exit repeat
+		repeat with t in ts
+			set u to ""
+			try
+				set u to URL of t
+			end try
+			if u contains "claude.ai" then
+				set found to true
+				set js to "var SEEN='" & seen & "';" & body
+				try
+					{exec_line}
+				on error msg
+					set r to "ASERR" & tab & msg
+				end try
+				if r starts with "OK" then set seen to seen & (text 4 thru 39 of r) & ","
+				set out to out & r & linefeed
+			end if
+		end repeat
 	end repeat
-	if theTab is missing value then return "__NO_TAB__"
-	{exec_line}
+	if not found then return "__NO_TAB__"
+	return out
 end tell'''
     try:
-        r = osa(script)
+        r = osa(script, timeout=25)
     except subprocess.TimeoutExpired:
-        return 'ERROR', f'{app} timed out'
+        return 'ERROR', [f'{app} timed out']
     if r.returncode != 0:
-        return classify(r.stderr), r.stderr.strip()
+        return classify(r.stderr), [r.stderr.strip()]
     out = r.stdout.strip()
     if out == '__NO_TAB__':
-        return 'NO_TAB', None
-    return 'OK', out
+        return 'NO_TAB', []
+    return 'OK', [l for l in out.split('\n') if l]
 
-def xhr(path):
-    """Fetch a claude.ai API path from an open tab. Raises Fetch with a diagnosis."""
-    js = ("var x=new XMLHttpRequest();"
-          f"x.open('GET','{path}',false);"
-          "x.setRequestHeader('Accept','application/json');"
-          "x.send();"
-          "x.status+'|||'+x.responseText")
+def fetch_accounts():
+    """Read every signed-in account from every running browser.
 
+    Returns ({uuid: {email, data}}, Fetch or None). The Fetch is the most
+    actionable problem seen, even when other tabs succeeded.
+    """
+    accounts = {}
     problems = []   # (rank, browser, status, detail)
-    RANK = {'JS_DISABLED': 0, 'NO_AUTOMATION': 1, 'ERROR': 2, 'NO_TAB': 3}
+    RANK = {'JS_DISABLED': 0, 'NO_AUTOMATION': 1, 'HTTP': 2, 'ERROR': 2, 'NO_TAB': 3}
 
     for app, engine in BROWSERS:
         if not app_installed(app) or not app_running(app):
             continue
-        status, payload = run_js(app, engine, js)
-        if status == 'OK':
-            code, _, body = payload.partition('|||')
-            code = code.strip()
-            if code != '200':
-                problems.append((2, app, 'HTTP', code))
-                continue
-            try:
-                return json.loads(body)
-            except Exception:
-                problems.append((2, app, 'BADJSON', body[:60]))
-                continue
-        problems.append((RANK.get(status, 2), app, status, payload))
+        status, lines = run_all_tabs(app, engine)
+        if status != 'OK':
+            problems.append((RANK.get(status, 2), app, status, lines[0] if lines else None))
+            continue
+        for line in lines:
+            kind, _, rest = line.partition('\t')
+            if kind == 'OK':
+                uuid, _, body = rest.partition('\t')
+                try:
+                    accounts.setdefault(uuid, json.loads(body))
+                except Exception:
+                    problems.append((2, app, 'BADJSON', body[:60]))
+            elif kind == 'ERR':
+                st, _, detail = rest.partition('\t')
+                problems.append((RANK.get(st, 2), app, st, detail))
+            elif kind == 'ASERR':
+                st = classify(rest)
+                problems.append((RANK.get(st, 2), app, st, rest))
 
-    if not problems:
-        raise Fetch('NO_BROWSER', 'No browser with claude.ai is running')
-    problems.sort(key=lambda p: p[0])
-    _, app, status, detail = problems[0]
-    raise Fetch(status, detail, app)
+    if problems:
+        problems.sort(key=lambda p: p[0])
+        _, app, status, detail = problems[0]
+        return accounts, Fetch(status, detail, app)
+    if not accounts:
+        return accounts, Fetch('NO_BROWSER', 'No browser with claude.ai is running')
+    return accounts, None
 
 class Fetch(Exception):
     def __init__(self, status, detail=None, app=None):
@@ -279,49 +334,39 @@ def remedy(err):
     return [f'{err.status}: {str(err.detail)[:70]}']
 
 # ── main ──────────────────────────────────────────────────────────────────────
-cfg     = load_config()
-org_id  = cfg.get('ORG_ID')
+cfg = load_config()
 
 def _flag(key, default):
     return cfg.get(key, default).strip().lower()
 
 # Menu bar preferences. Defaults reproduce the long-standing behaviour;
 # set these in ~/.claude-usage.conf to change it.
-MENUBAR_BOTH  = _flag('MENUBAR', 'session') == 'both'
+MENUBAR       = _flag('MENUBAR', 'session')       # session / weekly / both
 MENUBAR_COLOR = _flag('MENUBAR_COLOR', 'true') not in ('false', '0', 'no', 'off')
-stale   = None
-err     = None
 
-def discover_org():
-    """The account's claude.ai org. memberships[0] is not it for accounts that
-    also belong to an API (Console) org, so prefer one that can chat."""
-    orgs = [m['organization'] for m in xhr('/api/bootstrap')['account']['memberships']]
-    chat = [o for o in orgs if 'chat' in (o.get('capabilities') or [])]
-    org  = (chat or orgs)[0]['uuid']
-    save_org(org)
-    return org
+def label(acc):
+    """Optional short tag per account, from LABEL.<email>=<tag>."""
+    return cfg.get(f'LABEL.{acc.get("email", "")}', '')
+
+cache = load_cache()
+now   = time.time()
 
 try:
-    if not org_id:
-        org_id = discover_org()
-    try:
-        data = xhr(f'/api/organizations/{org_id}/usage')
-    except Fetch as e:
-        # A cached ORG_ID can be wrong (picked by an older version, or the
-        # account changed): rediscover once before giving up.
-        if e.status != 'HTTP' or e.detail not in ('403', '404'):
-            raise
-        org_id = discover_org()
-        data = xhr(f'/api/organizations/{org_id}/usage')
-    save_cache(data)
-except Fetch as e:
-    err = e
-    data, stale = load_cache()
+    live, err = fetch_accounts()
 except Exception as e:
-    err = Fetch('ERROR', str(e))
-    data, stale = load_cache()
+    live, err = {}, Fetch('ERROR', str(e))
 
-if data is None:
+for uuid, acc in live.items():
+    cache[uuid] = dict(acc, ts=now)
+# An account whose tab is gone keeps showing its last reading, up to MAX_STALE.
+cache = {u: a for u, a in cache.items() if now - a.get('ts', 0) <= MAX_STALE}
+save_cache(cache)
+
+# Sorted so the menu bar figures keep their places between refreshes.
+accounts = sorted(cache.items(), key=lambda kv: kv[1].get('email', ''))
+multi    = len(accounts) > 1
+
+if not accounts:
     print('✦' if err and err.status in ('NO_TAB', 'NO_BROWSER') else '✦ !')
     print('---')
     for line in remedy(err):
@@ -331,27 +376,42 @@ if data is None:
     print(f'Refresh | refresh=true color={BLUE}')
     sys.exit(0)
 
-s_pct   = data.get('five_hour', {}).get('utilization')
-s_reset = data.get('five_hour', {}).get('resets_at')
-w_pct   = data.get('seven_day', {}).get('utilization')
-w_reset = data.get('seven_day', {}).get('resets_at')
+def limits(acc):
+    d = acc['data']
+    return ((d.get('five_hour') or {}).get('utilization'),
+            (d.get('five_hour') or {}).get('resets_at'),
+            (d.get('seven_day') or {}).get('utilization'),
+            (d.get('seven_day') or {}).get('resets_at'))
 
 # ── menu bar icon ─────────────────────────────────────────────────────────────
-# MENUBAR=both adds the weekly figure: "✦ 42% · 18%".
+# One account:  "✦ 42%", MENUBAR=weekly "✦ 18%", MENUBAR=both "✦ 42% · 18%".
+# Several: one figure per account joined by " · " ("42%/18%" each with both),
+# prefixed by its LABEL if set. The colour follows the tightest limit shown.
 # MENUBAR_COLOR=false leaves the title uncoloured so it follows the system
 # menu bar colour. Never use "|" here, SwiftBar treats it as the delimiter.
-s_head = f'↺ {until(s_reset)}' if session_exhausted(s_pct) and s_reset else pct_str(s_pct)
+heads, worst = [], 0
+for uuid, acc in accounts:
+    s_pct, s_reset, w_pct, _ = limits(acc)
+    s_head = f'↺ {until(s_reset)}' if session_exhausted(s_pct) and s_reset else pct_str(s_pct)
+    if MENUBAR == 'both':
+        head  = f'{s_head}{"/" if multi else " · "}{pct_str(w_pct)}'
+        if s_pct is None and w_pct is None: head = ''
+        worst = max(worst, rank(s_pct), rank(w_pct))
+    elif MENUBAR == 'weekly':
+        head  = pct_str(w_pct) if w_pct is not None else ''
+        worst = max(worst, rank(w_pct))
+    else:
+        head  = s_head if s_pct is not None else ''
+        worst = max(worst, rank(s_pct))
+    if multi:
+        head = ' '.join(p for p in (label(acc), head or '?') if p)
+    heads.append(head)
 
-if MENUBAR_BOTH:
-    title = '✦' if (s_pct is None and w_pct is None) else f'✦ {s_head} · {pct_str(w_pct)}'
-    worst = max(rank(s_pct), rank(w_pct))
-else:
-    title = '✦' if s_pct is None else f'✦ {s_head}'
-    worst = rank(s_pct)
+title = ' '.join(p for p in ('✦', ' · '.join(h for h in heads if h)) if p)
 
 if not MENUBAR_COLOR:
     print(title)
-elif stale is not None:
+elif not live:
     print(f'{title} | color={DIM}')
 elif worst == 2:
     print(f'{title} | color={RED}')
@@ -362,28 +422,40 @@ else:
 
 print('---')
 
-if stale is not None:
-    print(f'Stale — {fmt_age(stale)} old | color={YELLOW} font=Menlo size=11')
+if err is not None and any(uuid not in live for uuid, _ in accounts):
+    if not multi:
+        print(f'Stale — {fmt_age(now - accounts[0][1]["ts"])} old | color={YELLOW} font=Menlo size=11')
     for line in remedy(err):
         print(f'{line} | color={DIM} font=Menlo size=11')
     print('---')
 
-# ── session ───────────────────────────────────────────────────────────────────
-s_bar, s_color = bar(s_pct)
-s_str  = '' if session_exhausted(s_pct) else (f'{int(s_pct)}%' if s_pct is not None else '?')
-s_time = f'↺ {until(s_reset)}' if s_reset else ''
-print(f'{join_fields("SESSION", s_str, s_time)} | color={TEXT} font=Menlo size=11')
-print(f'{s_bar} | color={s_color} font=Menlo size=10')
+for uuid, acc in accounts:
+    s_pct, s_reset, w_pct, w_reset = limits(acc)
 
-print('---')
+    if multi:
+        tag = label(acc)
+        print(f'{tag + "  " if tag else ""}{acc.get("email", "?")} | color={TEXT} font=Menlo size=12')
+        if uuid not in live:
+            print(f'Stale — {fmt_age(now - acc["ts"])} old | color={YELLOW} font=Menlo size=11')
 
-# ── weekly ────────────────────────────────────────────────────────────────────
-w_bar, w_color = bar(w_pct)
-w_str  = f'{int(w_pct)}%' if w_pct is not None else '?'
-w_time = f'↺ {until(w_reset)}' if w_reset else ''
-print(f'WEEKLY   {w_str}   {w_time} | color={TEXT} font=Menlo size=11')
-print(f'{w_bar} | color={w_color} font=Menlo size=10')
+    # ── session ───────────────────────────────────────────────────────────────
+    s_bar, s_color = bar(s_pct)
+    s_str  = '' if session_exhausted(s_pct) else (f'{int(s_pct)}%' if s_pct is not None else '?')
+    s_time = f'↺ {until(s_reset)}' if s_reset else ''
+    print(f'{join_fields("SESSION", s_str, s_time)} | color={TEXT} font=Menlo size=11')
+    print(f'{s_bar} | color={s_color} font=Menlo size=10')
 
-print('---')
+    if not multi:
+        print('---')
+
+    # ── weekly ────────────────────────────────────────────────────────────────
+    w_bar, w_color = bar(w_pct)
+    w_str  = f'{int(w_pct)}%' if w_pct is not None else '?'
+    w_time = f'↺ {until(w_reset)}' if w_reset else ''
+    print(f'WEEKLY   {w_str}   {w_time} | color={TEXT} font=Menlo size=11')
+    print(f'{w_bar} | color={w_color} font=Menlo size=10')
+
+    print('---')
+
 print(f'Open claude.ai | href=https://claude.ai/new color={BLUE}')
 print(f'Refresh | refresh=true color={BLUE}')
