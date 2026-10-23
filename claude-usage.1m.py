@@ -292,12 +292,27 @@ MENUBAR_COLOR = _flag('MENUBAR_COLOR', 'true') not in ('false', '0', 'no', 'off'
 stale   = None
 err     = None
 
+def discover_org():
+    """The account's claude.ai org. memberships[0] is not it for accounts that
+    also belong to an API (Console) org, so prefer one that can chat."""
+    orgs = [m['organization'] for m in xhr('/api/bootstrap')['account']['memberships']]
+    chat = [o for o in orgs if 'chat' in (o.get('capabilities') or [])]
+    org  = (chat or orgs)[0]['uuid']
+    save_org(org)
+    return org
+
 try:
     if not org_id:
-        boot   = xhr('/api/bootstrap')
-        org_id = boot['account']['memberships'][0]['organization']['uuid']
-        save_org(org_id)
-    data = xhr(f'/api/organizations/{org_id}/usage')
+        org_id = discover_org()
+    try:
+        data = xhr(f'/api/organizations/{org_id}/usage')
+    except Fetch as e:
+        # A cached ORG_ID can be wrong (picked by an older version, or the
+        # account changed): rediscover once before giving up.
+        if e.status != 'HTTP' or e.detail not in ('403', '404'):
+            raise
+        org_id = discover_org()
+        data = xhr(f'/api/organizations/{org_id}/usage')
     save_cache(data)
 except Fetch as e:
     err = e
